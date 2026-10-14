@@ -55,3 +55,15 @@ run reports the whole five-event batch. The handler only runs in response to
 those sensor events; there is no polling loop waking every 10 ms to check a
 flag. Compared with polling, this avoids periodic wake-ups when no event has
 arrived, and the delayed work coalesces a burst into one debounced callback.
+
+## L4 Task 1: Sensor Data with zbus
+
+The app defines one `sensor_data_chan` channel for a sample containing a
+sequence number, temperature, and humidity. The publisher sends ten simulated
+samples at 100 ms intervals. A synchronous zbus listener reads the channel's
+current message and logs a fast display update during publication. A separate
+thread-based subscriber waits for channel notifications and adds a 250 ms
+processing delay to model slower logging. The subscriber queue can retain all
+ten notifications in this finite demo; standard zbus subscribers receive a
+channel reference, so a delayed read may see the latest channel value rather
+than a historical copy of every publication.
