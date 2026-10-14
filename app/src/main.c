@@ -1,63 +1,60 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(race_demo, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(workqueue_demo, LOG_LEVEL_INF);
 
 #define STACK_SIZE 1024
-#define ITERATIONS 10000
-#define THREAD_PRIORITY 5
+#define SENSOR_THREAD_PRIORITY 5
+#define EVENTS_PER_BURST 5
+#define EVENT_INTERVAL_MS 4
+#define DEBOUNCE_INTERVAL_MS 20
+#define BURST_INTERVAL_MS 100
 
-/* Volatile keeps the deliberately split read and write observable. */
-static volatile unsigned int race_counter;
-static unsigned int protected_counter;
-static unsigned int threads_done;
+static atomic_t pending_events;
+static atomic_t debounce_runs;
 
-K_MUTEX_DEFINE(counter_mutex);
-K_MUTEX_DEFINE(done_mutex);
-
-static void counter_thread(void *thread_id, void *p2, void *p3)
+static void debounce_handler(struct k_work *work)
 {
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-	const unsigned int id = (unsigned int)(uintptr_t)thread_id;
+	ARG_UNUSED(work);
+	const int event_count = atomic_set(&pending_events, 0);
+	const int run = atomic_inc(&debounce_runs) + 1;
 
-	for (unsigned int i = 0; i < ITERATIONS; i++) {
-		/* Split the read-modify-write so the peer can overwrite this update. */
-		unsigned int value = race_counter;
-
-		k_yield();
-		race_counter = value + 1;
-	}
-
-	LOG_INF("Thread %u finished the unsynchronized increments", id);
-
-	for (unsigned int i = 0; i < ITERATIONS; i++) {
-		k_mutex_lock(&counter_mutex, K_FOREVER);
-		protected_counter++;
-		k_mutex_unlock(&counter_mutex);
-	}
-
-	LOG_INF("Thread %u finished the mutex-protected increments", id);
-
-	k_mutex_lock(&done_mutex, K_FOREVER);
-	threads_done++;
-	if (threads_done == 2) {
-		LOG_INF("Race result: %u (expected %u)", race_counter,
-			2 * ITERATIONS);
-		LOG_INF("Mutex result: %u (expected %u)", protected_counter,
-			2 * ITERATIONS);
-	}
-	k_mutex_unlock(&done_mutex);
+	LOG_INF("Debounced work handler run %d after %d sensor events", run,
+		event_count);
 }
 
-K_THREAD_DEFINE(counter_thread_a, STACK_SIZE, counter_thread,
-		(void *)(uintptr_t)1, NULL, NULL, THREAD_PRIORITY, 0, 0);
-K_THREAD_DEFINE(counter_thread_b, STACK_SIZE, counter_thread,
-		(void *)(uintptr_t)2, NULL, NULL, THREAD_PRIORITY, 0, 0);
+K_WORK_DELAYABLE_DEFINE(debounce_work, debounce_handler);
+
+static void sensor_sim_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1) {
+		for (int event = 1; event <= EVENTS_PER_BURST; event++) {
+			int total = atomic_inc(&pending_events) + 1;
+
+			LOG_INF("Sensor event %d/%d received (pending batch: %d)",
+				event, EVENTS_PER_BURST, total);
+			k_work_reschedule(&debounce_work,
+					  K_MSEC(DEBOUNCE_INTERVAL_MS));
+
+			if (event < EVENTS_PER_BURST) {
+				k_msleep(EVENT_INTERVAL_MS);
+			}
+		}
+
+		/* Leave a quiet interval before simulating the next burst. */
+		k_msleep(BURST_INTERVAL_MS);
+	}
+}
+
+K_THREAD_DEFINE(sensor_sim, STACK_SIZE, sensor_sim_fn,
+		NULL, NULL, NULL, SENSOR_THREAD_PRIORITY, 0, 0);
 
 int main(void)
 {
-	LOG_INF("Starting two equal-priority counter threads (%u increments each)",
-		ITERATIONS);
+	LOG_INF("Starting event-driven sensor workqueue demo");
 	return 0;
 }

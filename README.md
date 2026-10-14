@@ -44,3 +44,14 @@ holding a Zephyr mutex. The mutex makes each read-modify-write operation
 exclusive, so the `Mutex result` should be 20,000. Both results are printed
 after both threads complete, avoiding an early read of a counter that is still
 being updated.
+
+## L3 Task 1: Event-Driven Workqueue and Debounce
+
+The sensor simulator emits five events 4 ms apart, then waits before starting
+the next burst. Each event increments an atomic pending-event count and
+reschedules a delayed work item for 20 ms later. Rescheduling pushes the
+handler's deadline out until the burst has been quiet for 20 ms, so one handler
+run reports the whole five-event batch. The handler only runs in response to
+those sensor events; there is no polling loop waking every 10 ms to check a
+flag. Compared with polling, this avoids periodic wake-ups when no event has
+arrived, and the delayed work coalesces a burst into one debounced callback.
