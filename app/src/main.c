@@ -1,155 +1,119 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/task_wdt/task_wdt.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(pipeline_demo, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(scheduling_delay, LOG_LEVEL_INF);
 
-#define STACK_SIZE 1024
-#define PRODUCER_PRIORITY 5
-#define CONSUMER_PRIORITY 6
-#define HEALTH_PRIORITY 7
-#define QUEUE_CAPACITY 8
-#define PRODUCER_PERIOD_MS 100
-#define PRODUCER_SAMPLES 30
-#define CONSUMER_STALL_MS 2500
-#define CONSUMER_WDT_TIMEOUT_MS 1200
-#define HEALTH_PERIOD_MS 100
-#define QUEUE_WARNING_PERCENT 75
+#define STACK_SIZE 2048
+#define CONTROL_PRIORITY 4
+#define MAINTENANCE_PRIORITY 7
+#define EVENT_PERIOD_MS 250
+#define RESPONSE_DEADLINE_MS 10
+#define MAINTENANCE_LOAD_US 45000
 
-struct sample {
-	unsigned int sequence;
-	int value;
+struct control_event {
+	uint32_t seq;
+	uint32_t ready_ms;
 };
 
-K_MSGQ_DEFINE(sample_queue, sizeof(struct sample), QUEUE_CAPACITY, 4);
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_event), 4, 4);
+K_SEM_DEFINE(maintenance_start, 0, 1);
 
-static atomic_t consumer_stalled_once;
-static atomic_t consumer_finished;
+static atomic_t deadline_miss_count;
 
-K_THREAD_STACK_DEFINE(producer_stack, STACK_SIZE);
-K_THREAD_STACK_DEFINE(consumer_stack, STACK_SIZE);
-K_THREAD_STACK_DEFINE(health_stack, STACK_SIZE);
-static struct k_thread producer_thread;
-static struct k_thread consumer_thread;
-static struct k_thread health_thread;
-
-static void consumer_wdt_callback(int channel_id, void *user_data)
+static void event_timer_expiry(struct k_timer *timer)
 {
-	ARG_UNUSED(user_data);
+	ARG_UNUSED(timer);
 
-	LOG_ERR("Task watchdog expired for consumer (channel %d)", channel_id);
-}
+	static uint32_t sequence;
+	const struct control_event event = {
+		.seq = sequence++,
+		.ready_ms = k_uptime_get_32(),
+	};
 
-static void producer_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
+	/* Timer callbacks run in interrupt context; never wait on the queue. */
+	if (k_msgq_put(&control_queue, &event, K_NO_WAIT) != 0) {
+		const uint32_t misses = atomic_inc(&deadline_miss_count) + 1;
 
-	for (unsigned int sequence = 1; sequence <= PRODUCER_SAMPLES; sequence++) {
-		struct sample item = {
-			.sequence = sequence,
-			.value = (int)(sequence * 10),
-		};
-
-		if (k_msgq_put(&sample_queue, &item, K_NO_WAIT) != 0) {
-			LOG_WRN("Queue full; dropped sample #%u", sequence);
-		}
-
-		k_msleep(PRODUCER_PERIOD_MS);
-	}
-
-	/* A zero sequence marks completion and lets the consumer exit cleanly. */
-	const struct sample stop = {0};
-
-	k_msgq_put(&sample_queue, &stop, K_FOREVER);
-	LOG_INF("Producer finished");
-}
-
-static void consumer_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	const int wdt_channel = task_wdt_add(CONSUMER_WDT_TIMEOUT_MS,
-						    consumer_wdt_callback, NULL);
-
-	if (wdt_channel < 0) {
-		LOG_ERR("Failed to add consumer task watchdog channel (%d)",
-			wdt_channel);
-		atomic_set(&consumer_finished, 1);
+		sys_trace_named_event("control_queue_drop", event.seq, misses);
 		return;
 	}
 
-	while (1) {
-		struct sample item;
-
-		k_msgq_get(&sample_queue, &item, K_FOREVER);
-		if (item.sequence == 0) {
-			break;
-		}
-
-		LOG_INF("Consumer received sample #%u (value %d)", item.sequence,
-			item.value);
-		task_wdt_feed(wdt_channel);
-
-		if (atomic_cas(&consumer_stalled_once, 0, 1)) {
-			LOG_WRN("Simulating stuck consumer for %d ms",
-				CONSUMER_STALL_MS);
-			k_msleep(CONSUMER_STALL_MS);
-		}
-	}
-
-	task_wdt_delete(wdt_channel);
-	atomic_set(&consumer_finished, 1);
-	LOG_INF("Consumer finished");
+	sys_trace_named_event("control_event_ready", event.seq, event.ready_ms);
+	k_sem_give(&maintenance_start);
 }
 
-static void health_fn(void *p1, void *p2, void *p3)
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
+
+static void control_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
-	bool warning_active = false;
-	const unsigned int warning_level =
-		(QUEUE_CAPACITY * QUEUE_WARNING_PERCENT + 99) / 100;
+	uint32_t last_warning_count = 0;
 
-	while (!atomic_get(&consumer_finished)) {
-		const unsigned int used = k_msgq_num_used_get(&sample_queue);
+	while (true) {
+		struct control_event event;
 
-		if (used >= warning_level && !warning_active) {
-			LOG_WRN("Queue fill reached %u/%u (at least %u%%)", used,
-				QUEUE_CAPACITY, QUEUE_WARNING_PERCENT);
-			warning_active = true;
-		} else if (used < warning_level) {
-			warning_active = false;
+		if (k_msgq_get(&control_queue, &event, K_FOREVER) != 0) {
+			continue;
 		}
 
-		k_msleep(HEALTH_PERIOD_MS);
+		const uint32_t response_ms = k_uptime_get_32() - event.ready_ms;
+		const bool missed_deadline = response_ms > RESPONSE_DEADLINE_MS;
+
+		if (missed_deadline) {
+			atomic_inc(&deadline_miss_count);
+		}
+
+		const uint32_t misses = atomic_get(&deadline_miss_count);
+
+		sys_trace_named_event("control_event_complete", event.seq,
+				      response_ms);
+		if (missed_deadline) {
+			sys_trace_named_event("control_deadline_miss", event.seq,
+					      response_ms);
+		}
+
+		LOG_INF("[CONTROL] seq=%u response=%u ms (%s), misses=%u",
+			event.seq, response_ms,
+			missed_deadline ? "DEADLINE MISS" : "within deadline",
+			misses);
+
+		/* Report the first miss seen here, then summarize every ten more. */
+		if (misses > last_warning_count &&
+		    (last_warning_count == 0 || misses >= last_warning_count + 10)) {
+			LOG_WRN("Response-time deadline is %u ms; total misses: %u",
+				RESPONSE_DEADLINE_MS, misses);
+			last_warning_count = misses;
+		}
 	}
 }
 
+static void maintenance_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (true) {
+		k_sem_take(&maintenance_start, K_FOREVER);
+		k_busy_wait(MAINTENANCE_LOAD_US);
+	}
+}
+
+K_THREAD_DEFINE(control, STACK_SIZE, control_fn,
+		NULL, NULL, NULL, CONTROL_PRIORITY, 0, 0);
+K_THREAD_DEFINE(maintenance, STACK_SIZE, maintenance_fn,
+		NULL, NULL, NULL, MAINTENANCE_PRIORITY, 0, 0);
+
 int main(void)
 {
-	int ret = task_wdt_init(NULL);
+	LOG_INF("L6: control response-time deadline is %u ms",
+		RESPONSE_DEADLINE_MS);
+	LOG_INF("Control priority %d; maintenance priority %d",
+		CONTROL_PRIORITY, MAINTENANCE_PRIORITY);
 
-	if (ret != 0) {
-		LOG_ERR("Failed to initialize task watchdog (%d)", ret);
-		return ret;
-	}
-
-	k_thread_create(&consumer_thread, consumer_stack,
-			K_THREAD_STACK_SIZEOF(consumer_stack), consumer_fn,
-			NULL, NULL, NULL, CONSUMER_PRIORITY, 0, K_NO_WAIT);
-	k_thread_create(&producer_thread, producer_stack,
-			K_THREAD_STACK_SIZEOF(producer_stack), producer_fn,
-			NULL, NULL, NULL, PRODUCER_PRIORITY, 0, K_NO_WAIT);
-	k_thread_create(&health_thread, health_stack,
-			K_THREAD_STACK_SIZEOF(health_stack), health_fn,
-			NULL, NULL, NULL, HEALTH_PRIORITY, 0, K_NO_WAIT);
-
-	LOG_INF("Started producer/consumer pipeline: queue capacity %u",
-		QUEUE_CAPACITY);
+	k_timer_start(&event_timer, K_MSEC(500), K_MSEC(EVENT_PERIOD_MS));
 	return 0;
 }

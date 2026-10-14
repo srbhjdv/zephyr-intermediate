@@ -78,3 +78,28 @@ channel with a 1,200 ms timeout monitors the consumer; its callback logs when
 the consumer misses its deadline. The consumer feeds its watchdog after
 receiving work and removes its channel when it exits. A separate health thread
 checks queue occupancy every 100 ms and warns when it reaches 75% capacity.
+
+## L6 Task 1: Control Response-Time Scheduling
+
+The control thread's response-time guarantee is to begin processing each
+accepted timer event within 10 ms of its timer-release timestamp. The control log
+includes the event sequence, measured response time, whether the deadline was
+met, and the cumulative miss count. Queue overflows also count as missed
+events. Warnings are limited to the first miss and then every ten misses.
+
+The starter priorities caused the delay: Zephyr gives priority 4 higher
+urgency than priority 7, so the maintenance thread's 45 ms busy wait could run
+ahead of the control thread and exceed its 10 ms deadline. The correction
+raises control to priority 4 and lowers maintenance to priority 7, letting
+control run as soon as an event is queued. Maintenance work remains scheduled
+after the control thread blocks.
+
+The timer emits `control_event_ready` with sequence and release time;
+`control_event_complete` records sequence and response time, and
+`control_deadline_miss` marks violations. The app config enables CTF tracing,
+the POSIX backend, kernel thread monitoring, and the serial kernel shell for
+runtime inspection. Use the shell's `kernel threads` command to inspect thread
+priorities and states, then decode the POSIX backend's `channel0_0` capture
+with `babeltrace2 channel0_0` from the run directory. No runtime trace or
+measured before/after results are included because this submission was
+prepared without running or building the firmware.
