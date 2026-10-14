@@ -67,3 +67,14 @@ processing delay to model slower logging. The subscriber queue can retain all
 ten notifications in this finite demo; standard zbus subscribers receive a
 channel reference, so a delayed read may see the latest channel value rather
 than a historical copy of every publication.
+
+## L5 Task 1: Queue Pressure and Task Watchdog
+
+The producer sends 30 samples at 100 ms intervals into an eight-item message
+queue. The consumer processes the first sample, then deliberately sleeps for
+2,500 ms. During that stall, the queue reaches its 75% warning level (six of
+eight slots), fills, and the producer logs dropped samples. A task-watchdog
+channel with a 1,200 ms timeout monitors the consumer; its callback logs when
+the consumer misses its deadline. The consumer feeds its watchdog after
+receiving work and removes its channel when it exits. A separate health thread
+checks queue occupancy every 100 ms and warns when it reaches 75% capacity.
