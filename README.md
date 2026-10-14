@@ -30,3 +30,17 @@ contrast, `k_msleep()` suspends a thread until its timeout expires. Because the
 preemptive threads sleep at different intervals, their log interleaving changes
 over time; `T_HIGH` wakes most often, but priority determines which ready thread
 runs, not how often a thread's sleep interval expires.
+
+## L2 Task 1: Race Condition and Mutex
+
+Two equal-priority threads each increment a shared counter 10,000 times. In the
+first phase, each thread deliberately yields between reading and writing the
+counter. This exposes a lost-update race: both threads can read the same value,
+then write back the same incremented value, so the final `Race result` is
+typically below the expected 20,000. The exact result depends on scheduling.
+
+In the second phase, the threads increment a separate shared counter while
+holding a Zephyr mutex. The mutex makes each read-modify-write operation
+exclusive, so the `Mutex result` should be 20,000. Both results are printed
+after both threads complete, avoiding an early read of a counter that is still
+being updated.

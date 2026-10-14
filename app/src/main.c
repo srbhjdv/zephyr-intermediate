@@ -1,84 +1,63 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(scheduler_demo, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(race_demo, LOG_LEVEL_INF);
 
 #define STACK_SIZE 1024
+#define ITERATIONS 10000
+#define THREAD_PRIORITY 5
 
-/* Lower numeric priority values represent higher priorities in Zephyr. */
-#define T_LOW_PRIORITY  7
-#define T_MED_PRIORITY  5
-#define T_HIGH_PRIORITY 3
-#define T_COOP_PRIORITY -1
+/* Volatile keeps the deliberately split read and write observable. */
+static volatile unsigned int race_counter;
+static unsigned int protected_counter;
+static unsigned int threads_done;
 
-static void t_low_fn(void *p1, void *p2, void *p3)
+K_MUTEX_DEFINE(counter_mutex);
+K_MUTEX_DEFINE(done_mutex);
+
+static void counter_thread(void *thread_id, void *p2, void *p3)
 {
-	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
+	const unsigned int id = (unsigned int)(uintptr_t)thread_id;
 
-	while (1) {
-		LOG_INF("T_LOW running");
-		k_msleep(300);
-	}
-}
+	for (unsigned int i = 0; i < ITERATIONS; i++) {
+		/* Split the read-modify-write so the peer can overwrite this update. */
+		unsigned int value = race_counter;
 
-static void t_med_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	while (1) {
-		LOG_INF("T_MED running");
-		k_msleep(200);
-	}
-}
-
-static void t_high_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	while (1) {
-		LOG_INF("T_HIGH running");
-		k_msleep(100);
-	}
-}
-
-static void t_coop_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	for (int iteration = 1; iteration <= 5; iteration++) {
-		volatile unsigned int work = 0;
-
-		for (unsigned int i = 0; i < 100000; i++) {
-			work += i;
-		}
-
-		LOG_INF("T_COOP busy work iteration %d complete (%u)", iteration,
-			(unsigned int)work);
 		k_yield();
+		race_counter = value + 1;
 	}
 
-	LOG_INF("T_COOP finished");
+	LOG_INF("Thread %u finished the unsynchronized increments", id);
+
+	for (unsigned int i = 0; i < ITERATIONS; i++) {
+		k_mutex_lock(&counter_mutex, K_FOREVER);
+		protected_counter++;
+		k_mutex_unlock(&counter_mutex);
+	}
+
+	LOG_INF("Thread %u finished the mutex-protected increments", id);
+
+	k_mutex_lock(&done_mutex, K_FOREVER);
+	threads_done++;
+	if (threads_done == 2) {
+		LOG_INF("Race result: %u (expected %u)", race_counter,
+			2 * ITERATIONS);
+		LOG_INF("Mutex result: %u (expected %u)", protected_counter,
+			2 * ITERATIONS);
+	}
+	k_mutex_unlock(&done_mutex);
 }
 
-K_THREAD_DEFINE(t_low, STACK_SIZE, t_low_fn,
-		NULL, NULL, NULL, T_LOW_PRIORITY, 0, 0);
-K_THREAD_DEFINE(t_med, STACK_SIZE, t_med_fn,
-		NULL, NULL, NULL, T_MED_PRIORITY, 0, 0);
-K_THREAD_DEFINE(t_high, STACK_SIZE, t_high_fn,
-		NULL, NULL, NULL, T_HIGH_PRIORITY, 0, 0);
-K_THREAD_DEFINE(t_coop, STACK_SIZE, t_coop_fn,
-		NULL, NULL, NULL, T_COOP_PRIORITY, 0, 0);
+K_THREAD_DEFINE(counter_thread_a, STACK_SIZE, counter_thread,
+		(void *)(uintptr_t)1, NULL, NULL, THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(counter_thread_b, STACK_SIZE, counter_thread,
+		(void *)(uintptr_t)2, NULL, NULL, THREAD_PRIORITY, 0, 0);
 
 int main(void)
 {
-	LOG_INF("Scheduler demo started");
+	LOG_INF("Starting two equal-priority counter threads (%u increments each)",
+		ITERATIONS);
 	return 0;
 }
